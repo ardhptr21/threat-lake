@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "threatlake"
+version = "0.1.0"
+description = "Multi-source cyber threat intelligence data lakehouse for vulnerability prioritization"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "boto3>=1.34.0",
+  "kafka-python-ng>=2.2.2",
+  "pyspark==3.5.1",
+  "python-dotenv>=1.0.1",
+  "requests>=2.32.3",
+]
+
+[project.scripts]
+threatlake-nvd = "ingestion.nvd.producer:main"
+threatlake-cisa = "ingestion.cisa.producer:main"
+threatlake-github-advisory = "ingestion.github_advisory.producer:main"
+threatlake-github-events = "ingestion.github_events.producer:main"
+threatlake-exploitdb = "ingestion.exploitdb.producer:main"
+threatlake-bronze = "streaming.bronze_writer:main"
+threatlake-silver = "streaming.silver_processor:main"
+threatlake-gold = "streaming.gold_processor:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = [
+  "threatlake*",
+  "ingestion*",
+  "streaming*",
+  "airflow*",
+]

@@ -1,0 +1,334 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: threatlake
+      POSTGRES_PASSWORD: threatlake
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U threatlake -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: /bin/sh
+    command: -c "until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 2; done; mc mb -p local/threatlake || true; mc anonymous set none local/threatlake || true"
+    restart: "no"
+
+  kafka:
+    image: apache/kafka:4.1.2
+    hostname: kafka
+    container_name: kafka
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: CONTROLLER://:29093,PLAINTEXT_HOST://:9092,PLAINTEXT://:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_HOST://localhost:9092,PLAINTEXT://kafka:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: "1"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    ports:
+      - "9092:9092"
+    restart: unless-stopped
+
+  hive-metastore:
+    build:
+      context: .
+      dockerfile: docker/hive-metastore/Dockerfile
+    user: "0:0"
+    environment:
+      SERVICE_NAME: metastore
+      HIVE_METASTORE_PORT: 9083
+    volumes:
+      - hive-metastore-data:/tmp/hive
+    ports:
+      - "9083:9083"
+    restart: unless-stopped
+
+  lakehouse-init:
+    build:
+      context: .
+      dockerfile: docker/streaming/Dockerfile
+    depends_on:
+      minio:
+        condition: service_started
+        required: true
+      minio-init:
+        condition: service_completed_successfully
+        required: true
+      hive-metastore:
+        condition: service_started
+        required: true
+    environment: &threatlake-env
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      HIVE_METASTORE_URI: thrift://hive-metastore:9083
+      ICEBERG_CATALOG: threatlake
+      ICEBERG_NAMESPACE: default
+      ICEBERG_WAREHOUSE: s3a://threatlake/warehouse
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      S3_BUCKET: threatlake
+      THREATLAKE_PROJECT_DIR: /app
+      THREATLAKE_SQL_DIR: /app/sql
+      SPARK_MASTER_URL: local[*]
+      SPARK_CONF_DIR: /app/configs/spark
+      PYSPARK_SUBMIT_ARGS: "--packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.iceberg:iceberg-aws-bundle:1.6.1,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.apache.hadoop:hadoop-aws:3.3.4 pyspark-shell"
+    volumes:
+      - .:/app
+    command: ["python", "-m", "threatlake.bootstrap"]
+    restart: "no"
+
+  nvd-producer:
+    build:
+      context: .
+      dockerfile: docker/ingestion/Dockerfile
+    depends_on:
+      - kafka
+    environment:
+      <<: *threatlake-env
+    volumes:
+      - .:/app
+    command: ["python", "-m", "ingestion.nvd.producer", "--interval", "300"]
+    restart: unless-stopped
+
+  cisa-producer:
+    build:
+      context: .
+      dockerfile: docker/ingestion/Dockerfile
+    depends_on:
+      - kafka
+    environment:
+      <<: *threatlake-env
+    volumes:
+      - .:/app
+    command: ["python", "-m", "ingestion.cisa.producer", "--interval", "300"]
+    restart: unless-stopped
+
+  github-advisory-producer:
+    build:
+      context: .
+      dockerfile: docker/ingestion/Dockerfile
+    depends_on:
+      - kafka
+    environment:
+      <<: *threatlake-env
+    volumes:
+      - .:/app
+    command: ["python", "-m", "ingestion.github_advisory.producer", "--interval", "300"]
+    restart: unless-stopped
+
+  github-events-producer:
+    build:
+      context: .
+      dockerfile: docker/ingestion/Dockerfile
+    depends_on:
+      - kafka
+    environment:
+      <<: *threatlake-env
+    volumes:
+      - .:/app
+    command: ["python", "-m", "ingestion.github_events.producer", "--interval", "300"]
+    restart: unless-stopped
+
+  exploitdb-producer:
+    build:
+      context: .
+      dockerfile: docker/ingestion/Dockerfile
+    depends_on:
+      - kafka
+    environment:
+      <<: *threatlake-env
+    volumes:
+      - .:/app
+    command: ["python", "-m", "ingestion.exploitdb.producer", "--interval", "300"]
+    restart: unless-stopped
+
+  bronze-writer:
+    build:
+      context: .
+      dockerfile: docker/streaming/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_started
+        required: true
+      lakehouse-init:
+        condition: service_completed_successfully
+        required: true
+    environment:
+      <<: *threatlake-env
+    volumes:
+      - .:/app
+    command: ["python", "-m", "streaming.bronze_writer"]
+    restart: unless-stopped
+
+  silver-processor:
+    build:
+      context: .
+      dockerfile: docker/streaming/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_started
+        required: true
+      lakehouse-init:
+        condition: service_completed_successfully
+        required: true
+    environment:
+      <<: *threatlake-env
+    volumes:
+      - .:/app
+    command: ["python", "-m", "streaming.silver_processor"]
+    restart: unless-stopped
+
+  gold-processor:
+    build:
+      context: .
+      dockerfile: docker/streaming/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_started
+        required: true
+      lakehouse-init:
+        condition: service_completed_successfully
+        required: true
+    environment:
+      <<: *threatlake-env
+    volumes:
+      - .:/app
+    command: ["python", "-m", "streaming.gold_processor"]
+    restart: unless-stopped
+
+  trino:
+    build:
+      context: .
+      dockerfile: docker/trino/Dockerfile
+    depends_on:
+      hive-metastore:
+        condition: service_started
+        required: true
+      lakehouse-init:
+        condition: service_completed_successfully
+        required: true
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: true
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__FERNET_KEY: 14i8baOsl3-1mKK2M1YwGBFUCg5bC81RF0lB74J9BKM=
+      AIRFLOW__WEBSERVER__SECRET_KEY: threatlake-airflow-secret
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://threatlake:threatlake@postgres:5432/airflow
+      THREATLAKE_PROJECT_DIR: /opt/threatlake
+    volumes:
+      - .:/opt/threatlake
+    command: bash -c "airflow db migrate && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@threatlake.local || true"
+    restart: "no"
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+        required: true
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__FERNET_KEY: 14i8baOsl3-1mKK2M1YwGBFUCg5bC81RF0lB74J9BKM=
+      AIRFLOW__WEBSERVER__SECRET_KEY: threatlake-airflow-secret
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://threatlake:threatlake@postgres:5432/airflow
+      THREATLAKE_PROJECT_DIR: /opt/threatlake
+    volumes:
+      - .:/opt/threatlake
+    command: airflow webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+        required: true
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__FERNET_KEY: 14i8baOsl3-1mKK2M1YwGBFUCg5bC81RF0lB74J9BKM=
+      AIRFLOW__WEBSERVER__SECRET_KEY: threatlake-airflow-secret
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://threatlake:threatlake@postgres:5432/airflow
+      THREATLAKE_PROJECT_DIR: /opt/threatlake
+    volumes:
+      - .:/opt/threatlake
+    command: airflow scheduler
+    restart: unless-stopped
+
+  superset:
+    build:
+      context: .
+      dockerfile: docker/superset/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: true
+    environment:
+      SUPERSET_ADMIN_USERNAME: admin
+      SUPERSET_ADMIN_PASSWORD: admin
+      SUPERSET_ADMIN_EMAIL: admin@threatlake.local
+      SUPERSET_ADMIN_FIRSTNAME: ThreatLake
+      SUPERSET_ADMIN_LASTNAME: Admin
+    ports:
+      - "8088:8088"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  minio-data:
+  hive-metastore-data:

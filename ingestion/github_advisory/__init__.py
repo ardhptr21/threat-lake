@@ -1,0 +1,2 @@
+"""GitHub advisory ingestion."""
+
