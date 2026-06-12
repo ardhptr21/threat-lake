@@ -310,24 +310,6 @@ services:
     command: airflow scheduler
     restart: unless-stopped
 
-  superset:
-    build:
-      context: .
-      dockerfile: docker/superset/Dockerfile
-    depends_on:
-      postgres:
-        condition: service_healthy
-        required: true
-    environment:
-      SUPERSET_ADMIN_USERNAME: admin
-      SUPERSET_ADMIN_PASSWORD: admin
-      SUPERSET_ADMIN_EMAIL: admin@threatlake.local
-      SUPERSET_ADMIN_FIRSTNAME: ThreatLake
-      SUPERSET_ADMIN_LASTNAME: Admin
-    ports:
-      - "8088:8088"
-    restart: unless-stopped
-
 volumes:
   postgres-data:
   minio-data:
